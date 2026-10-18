@@ -530,3 +530,55 @@ async def test_device_name_migration_idempotent(
 
         # Verify name unchanged (migration skipped because name_by_user already set)
         assert device.name_by_user == first_name
+
+
+@pytest.mark.asyncio
+async def test_device_name_migration_uses_supported_registry_apis(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Setup must not trigger Home Assistant's device registry deprecation warnings.
+
+    Iterating ``device_registry.devices`` and reading ``DeviceEntry.config_entries``
+    both log a deprecation warning naming this integration (issues #368, #372).
+    Names are still restored from the registry on a reload, so the supported
+    helpers must preserve that behaviour.
+    """
+    from homeassistant.helpers import device_registry as dr
+
+    unit = _create_mock_unit("abc12345-1234-5678-9abc-def123456789", "Dining Room")
+    building = _create_mock_building("Test Home", [unit])
+    context = _create_mock_context_with_units([building])
+
+    with patch(MOCK_CLIENT_PATH) as mock_client:
+        client = mock_client.return_value
+        client.get_wifi_signal = AsyncMock(return_value=None)
+        client.login = AsyncMock()
+        client.close = AsyncMock()
+        client.get_user_context = AsyncMock(return_value=context)
+        type(client).is_authenticated = PropertyMock(return_value=True)
+
+        entry = MockConfigEntry(
+            domain=DOMAIN,
+            data={CONF_EMAIL: "test@example.com", CONF_PASSWORD: "password"},
+            unique_id="test@example.com",
+        )
+        entry.add_to_hass(hass)
+
+        caplog.clear()
+        await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+
+        device_reg = dr.async_get(hass)
+        device = dr.async_entries_for_config_entry(device_reg, entry.entry_id)[0]
+        device_reg.async_update_device(device.id, name_by_user="My Custom Name")
+
+        # Reload runs the save/restore path again
+        await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+
+        device = device_reg.async_get(device.id)
+        assert device is not None
+        assert device.name_by_user == "My Custom Name"
+
+    assert "Detected that custom integration 'melcloudhome'" not in caplog.text
